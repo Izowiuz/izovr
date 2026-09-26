@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Dumps raw state into stats/. Read-only. Re-run to refresh.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+O="$IZOVR_ROOT/stats"; mkdir -p "$O"
+D=$(dongle_iface)
+K=$(uname -r)
+run() { printf '$ %s\n' "$*"; "$@" 2>&1; printf '\n'; }
+
+{
+run uname -r
+run bash -c "grep -E 'RTW89|MAC80211_DEBUGFS|CFG80211_DEBUGFS|^CONFIG_DEBUG_FS' /boot/config-$K"
+run bash -c "lsmod | grep -E '^rtw89|^cfg80211|^mac80211'"
+run bash -c "for m in rtw89_core rtw89_usb mac80211 cfg80211; do echo \"[\$m]\"; modinfo \$m 2>/dev/null | grep '^parm:'; done"
+run bash -c "cat /sys/module/cfg80211/parameters/ieee80211_regdom"
+run bash -c "ls /etc/modprobe.d/"
+} > "$O/kernel.txt"
+
+{
+run iw reg get
+run bash -c "iw list | awk '/\* [0-9]+(\.[0-9]+)? MHz/{gsub(/\*|MHz/,\"\"); if (\$1+0>=5925 && \$1+0<=7125) c++} END{print c+0\" channels in 5925-7125 MHz\"}'"
+[[ -n "$D" ]] && { run iw dev "$D" link; run iw dev "$D" station dump; run iw dev "$D" get power_save; } || echo "dongle not present"
+run bash -c "for r in /sys/class/rfkill/rfkill*; do [ -e \"\$r\" ] && echo \"\$(cat \$r/name) type=\$(cat \$r/type) soft=\$(cat \$r/soft) hard=\$(cat \$r/hard)\"; done"
+} > "$O/radio.txt"
+
+{
+run ip -br addr
+run bash -c "nmcli -t -f DEVICE,TYPE,STATE,CONNECTION dev status"
+run bash -c "nmcli -t -f NAME,TYPE,AUTOCONNECT con show"
+run bash -c "nmcli radio"
+run bash -c "firewall-cmd --get-default-zone; firewall-cmd --get-active-zones; firewall-cmd --zone=public --list-ports"
+run bash -c "ls /etc/NetworkManager/conf.d/ /etc/NetworkManager/dispatcher.d/ 2>/dev/null"
+run bash -c "systemctl is-active wg-quick@wg0-client"
+} > "$O/network.txt"
+
+{
+run nvidia-smi --query-gpu=name,driver_version,utilization.gpu,utilization.encoder,memory.used,power.draw,temperature.gpu --format=csv
+run bash -c "vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverName'"
+run bash -c "ls /usr/share/vulkan/icd.d/"
+run bash -c "for p in \$(pgrep -x 'vrserver|vrcompositor' 2>/dev/null); do echo \"pid \$p \$(basename \$(tr '\\0' '\\n' < /proc/\$p/cmdline | head -1))\"; grep -oE 'libvulkan_[a-z]+\.so|libnvidia-glcore[^ ]*' /proc/\$p/maps 2>/dev/null | sort -u; done"
+} > "$O/gpu.txt"
+
+{
+run bash -c "pw-metadata -n settings 2>/dev/null | grep -E 'clock'"
+run bash -c "timeout 8 pw-top -b -n 2 2>/dev/null | tail -30"
+run bash -c "pactl list sinks short"
+run bash -c "pactl list sink-inputs | grep -E 'Sink Input|Sink:|application.name'"
+} > "$O/audio.txt"
+
+{
+run bash -c "grep -m1 '\"buildid\"' $STEAM_ROOT/steamapps/appmanifest_250820.acf"
+run bash -c "ls $STEAM_ROOT/steamapps/common/SteamVR/drivers/"
+run bash -c "cat $HOME/.config/openvr/openvrpaths.vrpath 2>/dev/null"
+run bash -c "readlink -f $HOME/.config/openxr/1/active_runtime.json 2>/dev/null"
+run bash -c "python3 -c \"import json;print(json.dumps(json.load(open('$STEAM_ROOT/config/steamvr.vrsettings')),indent=1))\" 2>/dev/null"
+run bash -c "grep 'SVLDataLinkTransferUDP::Init' $STEAM_ROOT/logs/driver_vrlink.txt 2>/dev/null | tail -5"
+run bash -c "getcap $STEAM_ROOT/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher"
+} > "$O/steamvr.txt"
+
+{
+L="$STEAM_ROOT/logs/driver_vrlink.txt"; C="$STEAM_ROOT/logs/vrcompositor.txt"; V="$STEAM_ROOT/logs/vrserver.txt"
+for pair in "Reset video stream:$L" "CAudioJitterBuffer fade out:$L" "network change:$L" \
+            "WaitForAcquire timed out:$C" "vkerror=-4:$C" \
+            "Failed to set thread priority:$V" "Connection inactive:$V"; do
+    pat="${pair%%:*}"; f="${pair##*:}"
+    printf '%-34s %s\n' "$pat" "$(grep -c "$pat" "$f" 2>/dev/null | head -1)"
+done
+printf '\n'
+run bash -c "grep -oE '\[[0-9]+ messages suppressed\]' $C 2>/dev/null | tail -3"
+run bash -c "grep -c 'Attempting connection to frame_' $STEAM_ROOT/logs/remote_connections.txt 2>/dev/null"
+run bash -c "ulimit -r; ulimit -e"
+run bash -c "ls /etc/security/limits.d/ /etc/polkit-1/rules.d/ 2>/dev/null"
+} > "$O/counters.txt"
+
+date -Iseconds > "$O/.generated"
+ls -l "$O" | awk 'NR>1{print "  "$5" B  "$9}'

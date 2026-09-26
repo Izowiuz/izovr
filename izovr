@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Status overview. Runs the check of every setting; changes nothing.
+#   ./izovr            everything
+#   ./izovr session    what to switch before and after playing
+set -uo pipefail
+cd "$(dirname "$0")"
+for a in "$@"; do [[ "$a" == "--brief" ]] && export IZOVR_BRIEF=1; done
+source scripts/lib.sh
+
+PERMANENT=(rt-priority regdomain firewall-ports gpu-isolation dongle-powersave polkit-network)
+CAVEAT=(idle-wifi-card vrlink-single-link vrlink-encoder)
+SESSION=(vpn-tunnel dongle-lowlatency pipewire-resample)
+
+if [[ "${1:-}" == "session" ]]; then
+    printf '\n%sBefore playing%s\n' "$C_B" "$C_0"
+    cat <<'A'
+  ./scripts/vpn-tunnel --apply          stop the tunnel (it kills VR sessions)
+  plug in the dongle
+  start SteamVR by hand                 Steam will not do it for you
+  ./scripts/dongle-lowlatency --apply   optional radio tweaks
+  ./scripts/pipewire-resample --apply       only if audio crackles
+A
+    printf '\n%sAfter playing%s\n' "$C_B" "$C_0"
+    cat <<'B'
+  ./scripts/vpn-tunnel --restore        tunnel back up
+  ./scripts/pipewire-resample --restore
+  unplug the dongle                     otherwise Steam retries every 60s
+B
+    echo
+    exit 0
+fi
+
+printf '\n%s== PERMANENT - set once, never think about again ==%s\n' "$C_B" "$C_0"
+for s in "${PERMANENT[@]}"; do ./scripts/"$s"; done
+printf '\n%s== PERMANENT, WITH ONE CATCH ==%s\n' "$C_B" "$C_0"
+for s in "${CAVEAT[@]}"; do ./scripts/"$s"; done
+printf '\n%s== PER SESSION - switch on before, off after ==%s\n' "$C_B" "$C_0"
+for s in "${SESSION[@]}"; do ./scripts/"$s"; done
+printf '\n%sHide the probe lines:%s ./izovr --brief\n' "$C_B" "$C_0"
+printf '%sChecklist:%s ./izovr session    %sDiagnostics:%s ./scripts/vr-verify, ./scripts/measure\n\n' "$C_B" "$C_0" "$C_B" "$C_0"

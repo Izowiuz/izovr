@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Sample the host during a live VR session and count what went wrong.
+# Read-only. Usage: ./scripts/measure [seconds]   (default 180)
+#
+# Reference points measured on this machine, all in Alyx:
+#   0.433 /s  baseline, nothing tuned
+#   0.255 /s  after GPU isolation
+#   0.036 /s  after the rtprio fix        <- best so far
+#   0.100 /s  after the update + reboot lost the link tweaks
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+SECS="${1:-180}"; [[ "$SECS" =~ ^[0-9]+$ ]] || SECS=180
+L="$STEAM_ROOT/logs/driver_vrlink.txt"
+C="$STEAM_ROOT/logs/vrcompositor.txt"
+OUT="$REPORT_DIR/sample-$(date +%Y%m%d-%H%M%S).tsv"
+D=$(dongle_iface)
+
+count() { local n; n=$(grep -c "$2" "$1" 2>/dev/null | head -1); echo "${n:-0}"; }
+
+pgrep -x vrserver >/dev/null || miss "vrserver is not running - is the VR session live?"
+r0=$(count "$L" "Reset video stream"); a0=$(count "$L" "CAudioJitterBuffer fade out")
+w0=$(count "$C" "WaitForAcquire timed out"); v0=$(count "$C" "vkerror=-4")
+
+title "Sampling for ${SECS}s - go back to the game"
+printf 'ts\tgpu%%\tenc%%\tclk\twatt\tload\tsignal\ttxMbit\n' > "$OUT"
+end=$(( $(date +%s) + SECS ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    read -r g e c w <<< "$(nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | tr -d ',')"
+    sig=$(iw dev "$D" link 2>/dev/null | awk '/signal:/{print $2}')
+    tx=$(iw dev "$D" link 2>/dev/null | awk '/tx bitrate:/{print $3}')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%H:%M:%S)" "$g" "$e" "$c" "$w" "$(cut -d' ' -f1 /proc/loadavg)" "${sig:-?}" "${tx:-?}" >> "$OUT"
+    read -t 2 -r _ < /dev/zero 2>/dev/null || true
+done
+
+title "Result over ${SECS}s"
+python3 - "$OUT" <<'PY'
+import sys, statistics as st
+rows=[l.split('\t') for l in open(sys.argv[1]).read().splitlines()[1:] if l.strip()]
+for name,i in (("GPU %",1),("Encoder %",2),("Clock MHz",3),("Watt",4),("Load",5),("Signal dBm",6),("TX Mbit",7)):
+    v=[]
+    for r in rows:
+        try: v.append(float(r[i].replace('dBm','')))
+        except: pass
+    if v: print(f"  {name:<12} avg {st.mean(v):7.1f}   min {min(v):7.1f}   max {max(v):7.1f}")
+PY
+r1=$(count "$L" "Reset video stream"); a1=$(count "$L" "CAudioJitterBuffer fade out")
+w1=$(count "$C" "WaitForAcquire timed out"); v1=$(count "$C" "vkerror=-4")
+dr=$(( r1 - r0 ))
+printf '  %-22s %s\n' "video resets"      "$dr  ($(python3 -c "print(f'{$dr/$SECS:.3f}')")/s)"
+printf '  %-22s %s\n' "audio dropouts"    "$(( a1 - a0 ))"
+printf '  %-22s %s\n' "WaitForAcquire"    "$(( w1 - w0 ))"
+printf '  %-22s %s\n' "VK_ERROR_DEVICE_LOST" "$(( v1 - v0 ))"
+info "raw samples: $OUT"

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Inbound ports the Steam Frame stream needs on the host.
+#
+#   27031-27036/udp   stream + host discovery (Steam Remote Play)
+#   27036-27037/tcp   Remote Play session control
+#   10400-10401/udp   vrlink transport - NOT in Valve's documented port list.
+#                     Found by reading driver_vrlink.txt:
+#                     "SVLDataLinkTransferUDP::Init 192.168.42.237 dev eno1 10400"
+#                     10401 comes from the r/SteamFrame troubleshooting thread.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+title "Firewall ports"
+
+if ! systemctl is-active --quiet firewalld; then
+    ok "firewalld inactive - nothing blocks the stream"
+    exit 0
+fi
+ZONE=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
+
+case "$MODE" in
+  help) sed -n '2,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      # There is no unprivileged way to read this. firewalld splits its polkit
+      # actions - FirewallD1.info is allow_active=yes, but FirewallD1.config.info,
+      # which --list-ports needs, is auth_admin_keep - and /etc/firewalld is
+      # root-only (drwxr-x---), so the file cannot be parsed either.
+      #
+      # So this one check asks. A prompt from a command you just typed beats a
+      # verdict of "unreadable", which tells you nothing. It only asks when a
+      # terminal is attached; piped or run from another script it stays quiet
+      # rather than blocking on an invisible prompt.
+      #
+      # `sudo -v` once up front makes this silent for the rest of the sudo timeout.
+      if [[ -t 0 ]]; then
+          probe "sudo firewall-cmd --zone=$ZONE --list-ports  (may ask for your password)"
+          ports=$(sudo firewall-cmd --zone="$ZONE" --list-ports 2>/dev/null) || ports=""
+      else
+          probe "sudo -n firewall-cmd --zone=$ZONE --list-ports  (no terminal, so no prompt)"
+          ports=$(sudo -n firewall-cmd --zone="$ZONE" --list-ports 2>/dev/null) || ports=""
+      fi
+      if [[ -n "$ports" ]]; then
+          for p in "$REMOTE_PLAY_UDP/udp" "$REMOTE_PLAY_TCP/tcp" "$VRLINK_UDP/udp"; do
+              [[ "$ports" == *"${p%%/*}"* ]] && st=open || st=missing
+              cmp_state "$p" "$st" "open in $ZONE" "$([[ "$st" == open ]] && echo ok || echo miss)"
+          done
+          [[ "$ports" == *"${VRLINK_UDP%%-*}"* ]] || hint "$0"
+      else
+          cmp_state "zone $ZONE" "could not read" "readable" miss
+          info "no answer from firewalld - wrong password, cancelled, or no terminal."
+          info "read it directly with:"
+          info "    sudo firewall-cmd --zone=$ZONE --list-ports"
+          info "expected: $REMOTE_PLAY_UDP/udp $REMOTE_PLAY_TCP/tcp $VRLINK_UDP/udp"
+      fi
+      ;;
+  apply)
+      info "zone: $ZONE   adding: $REMOTE_PLAY_UDP/udp, $REMOTE_PLAY_TCP/tcp, $VRLINK_UDP/udp"
+      info "permanent + reload. Undo: same with --remove-port."
+      confirm "apply?" || { miss "cancelled"; exit 0; }
+      sudo firewall-cmd --permanent --zone="$ZONE" --add-port="$REMOTE_PLAY_UDP/udp" >/dev/null && ok "udp $REMOTE_PLAY_UDP"
+      sudo firewall-cmd --permanent --zone="$ZONE" --add-port="$REMOTE_PLAY_TCP/tcp" >/dev/null && ok "tcp $REMOTE_PLAY_TCP"
+      sudo firewall-cmd --permanent --zone="$ZONE" --add-port="$VRLINK_UDP/udp"      >/dev/null && ok "udp $VRLINK_UDP"
+      sudo firewall-cmd --reload >/dev/null && ok "reloaded"
+      ;;
+  restore)
+      confirm "remove the stream ports from zone $ZONE?" || exit 0
+      for p in "$REMOTE_PLAY_UDP/udp" "$REMOTE_PLAY_TCP/tcp" "$VRLINK_UDP/udp"; do
+          sudo firewall-cmd --permanent --zone="$ZONE" --remove-port="$p" >/dev/null 2>&1 && ok "removed $p"
+      done
+      sudo firewall-cmd --reload >/dev/null && ok "reloaded"
+      ;;
+esac

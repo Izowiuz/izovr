@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Silence the unused built-in Wi-Fi card.
+#
+# The AX210 in this board is Wi-Fi 6E, so its periodic scans sweep the same 6 GHz
+# band the headset link runs on, with antennas a few centimetres from the dongle.
+# It is unused here: Ethernet carries everything and the only saved Wi-Fi profile
+# is a phone hotspot from July 2024.
+#
+# `nmcli dev set ... managed no` does not survive a reboot, hence the conf.d file.
+#
+# TRADE-OFF: with this applied you cannot use that card for Wi-Fi until you undo it.
+# Bluetooth is unaffected - it is a separate USB device on the same module.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+CONF=/etc/NetworkManager/conf.d/95-izovr-quiet-wifi.conf
+
+title "Idle Wi-Fi card"
+
+case "$MODE" in
+  help) sed -n '2,13p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "grep -rlsE unmanaged-devices /etc/NetworkManager/conf.d/ NetworkManager.conf"
+      src=$(grep -rlsE 'unmanaged-devices' /etc/NetworkManager/conf.d/ /etc/NetworkManager/NetworkManager.conf 2>/dev/null | tr '\n' ' ')
+      cmp_state "persistent rule" "${src:-none}" "a file under conf.d" opt
+      probe "nmcli -t -f DEVICE,TYPE,STATE dev status"
+      for i in $(other_wifi_ifaces); do
+          st=$(nmcli -t -f DEVICE,STATE dev status | grep "^$i:" | cut -d: -f2)
+          if [[ "$st" == connected ]]; then
+              bad "$i is CONNECTED - leave this one alone, you are using it"
+          else
+              cmp_state "$i" "$st" "unmanaged"
+          fi
+      done
+      [[ -z "$(other_wifi_ifaces)" ]] && info "no other Wi-Fi card present"
+      ;;
+  apply)
+      ifaces=$(other_wifi_ifaces)
+      [[ -z "$ifaces" ]] && { ok "nothing to silence"; exit 0; }
+      for i in $ifaces; do
+          st=$(nmcli -t -f DEVICE,STATE dev status | grep "^$i:" | cut -d: -f2)
+          [[ "$st" == connected ]] && { bad "$i is connected - skipping, it would cut your network"; continue; }
+          info "$CONF -> unmanaged-devices=interface-name:$i"
+          confirm "silence $i permanently?" || continue
+          printf '[keyfile]\nunmanaged-devices=interface-name:%s\n' "$i" | sudo tee "$CONF" >/dev/null && ok "written"
+          sudo systemctl reload NetworkManager && ok "NetworkManager reloaded"
+      done
+      ;;
+  restore)
+      [[ -f "$CONF" ]] || { ok "nothing to restore"; exit 0; }
+      confirm "give the card back to NetworkManager?" || exit 0
+      sudo rm -f "$CONF" && sudo systemctl reload NetworkManager && ok "restored"
+      ;;
+esac

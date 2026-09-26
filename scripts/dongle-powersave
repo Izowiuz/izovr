@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Keep the 6 GHz dongle's radio awake. Two separate layers, both needed:
+#
+#   host side      iw dev <if> set power_save off   (mac80211)
+#   firmware side  rtw89_core.disable_ps_mode=Y     (the card's own low-power mode)
+#
+# Valve's SteamOS helper (holo-realtek-firmware-toggles) turns the firmware one off
+# via debugfs, which openSUSE does not build. The module parameter reaches the same
+# thing without debugfs, but only at module load time.
+#
+# The host side must go through a NetworkManager dispatcher, NOT the connection
+# profile: Steam rewrites the "Steam Frame Wireless Adapter" profile on every
+# pairing, which silently reverted our earlier powersave=disable setting.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+DISP=/etc/NetworkManager/dispatcher.d/90-steamframe-powersave
+MODCONF=/etc/modprobe.d/99-rtw89-lowlatency.conf
+D=$(dongle_iface)
+
+title "Dongle power save (host + firmware)"
+
+case "$MODE" in
+  help) sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "nmcli dev status; iw dev <dongle> get power_save"
+      if [[ -n "$D" ]]; then
+          dstate=$(nmcli -t -f DEVICE,STATE dev status 2>/dev/null | grep "^$D:" | cut -d: -f2)
+          ps=$(iw dev "$D" get power_save 2>/dev/null | awk '{print $NF}')
+          if [[ "$dstate" == connected ]]; then
+              cmp_state "$D power save" "$ps" "off"
+          else
+              cmp_state "$D power save" "$ps (link $dstate)" "off once connected" \
+                  "$([[ "$ps" == off ]] && echo ok || echo miss)"
+              info "the dispatcher fires on the 'up' event, so this only settles once the link is up"
+          fi
+      else
+          info "dongle not plugged in - live state unknown"
+      fi
+      probe "grep -rlsE 'power_save off' /etc/NetworkManager/dispatcher.d/ /etc/udev/rules.d/"
+      hsrc=$(grep -rlsE 'power_save[[:space:]]+off' /etc/NetworkManager/dispatcher.d/ /etc/udev/rules.d/ 2>/dev/null | tr '\n' ' ')
+      cmp_state "host side source" "${hsrc:-nothing found}" "a dispatcher or udev rule" \
+          "$([[ -n "$hsrc" ]] && echo ok || echo miss)"
+      probe "grep -rlsE rtw89_core.*disable_ps_mode /etc/modprobe.d/"
+      fsrc=$(grep -rlsE 'rtw89_core.*disable_ps_mode' /etc/modprobe.d/ 2>/dev/null | tr '\n' ' ')
+      cmp_state "firmware source" "${fsrc:-nothing found}" "a modprobe.d entry" \
+          "$([[ -n "$fsrc" ]] && echo ok || echo miss)"
+      [[ -z "$hsrc$fsrc" ]] && hint "$0"
+      ;;
+  apply)
+      info "1. $DISP  - sets power_save off after every interface 'up'"
+      info "2. $MODCONF  - options rtw89_core disable_ps_mode=Y"
+      info "The module parameter only takes effect when rtw89 loads: unplug and replug"
+      info "the dongle, or reboot."
+      confirm "apply both?" || { miss "cancelled"; exit 0; }
+      sudo tee "$DISP" >/dev/null <<'DISPEOF'
+#!/bin/bash
+# izovr: power save breaks the VR stream on the Steam Frame dongle.
+# Setting it in the NM profile does not survive - Steam rewrites that profile.
+IFACE="$1"; ACTION="$2"
+case "$IFACE" in wl*u[0-9]*) ;; *) exit 0 ;; esac
+[ "$ACTION" = "up" ] || exit 0
+/usr/sbin/iw dev "$IFACE" set power_save off 2>/dev/null
+logger -t izovr-steamframe "power_save off on $IFACE"
+exit 0
+DISPEOF
+      sudo chmod 755 "$DISP" && ok "dispatcher written"
+      printf 'options rtw89_core disable_ps_mode=Y\n' | sudo tee "$MODCONF" >/dev/null && ok "module parameter written"
+      [[ -n "$D" ]] && sudo iw dev "$D" set power_save off 2>/dev/null && ok "applied to $D right now"
+      ;;
+  restore)
+      confirm "remove dispatcher and module parameter?" || exit 0
+      sudo rm -f "$DISP" "$MODCONF" && ok "removed - replug the dongle or reboot"
+      ;;
+esac

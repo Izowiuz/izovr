@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Disable vrlink's "Uber link" - the mode that keeps the dedicated 6 GHz dongle
+# path and the ordinary LAN path bound at the same time.
+#
+# Why you might want this: the two paths are not equal. Measured on this host,
+# round-trip to the headset was 2.36 ms over the dongle and 58.9 ms through the
+# router, with 29 ms of jitter. vrlink picks the dongle as primary
+# ("SVLDataLinkUber: Found primary link 10.35.78.25") but keeps the slow one
+# bound, and a tunnel interface in that set is enough to kill sessions (issue 910).
+#
+# USE THE HEADSET SETTING INSTEAD. There is a supported toggle, reported by users
+# and confirmed to remove the lag spikes:
+#     in the headset, while connected to the PC:
+#     SteamVR -> VR settings -> Steam Link -> turn off multilink
+# The VR settings panel is only reachable during an active stream, which is why it
+# looks hidden. Only fall back to the key below if that toggle is missing.
+#
+# UNDOCUMENTED. The key is absent from resources/settings/default.vrsettings, but
+# the strings live in drivers/vrlink/bin/linux64/driver_vrlink.so:
+#   disableUberLink       used here
+#   allowMultipleLinks    alternative, see --help
+# It may do nothing, or something unintended. Removing the setting undoes it.
+#
+# Verify from the log, not by feel: with the Uber link off, driver_vrlink.txt
+# should no longer say "Uber link enabled" and should bind a single transport.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+CFG="$STEAM_ROOT/config/steamvr.vrsettings"
+L="$STEAM_ROOT/logs/driver_vrlink.txt"
+KEY=disableUberLink
+
+get() { python3 -c "
+import json,os
+d=json.load(open('$CFG')) if os.path.exists('$CFG') else {}
+print(json.dumps(d.get('driver_vrlink',{}).get('$KEY','unset')))" 2>/dev/null; }
+
+set_key() { python3 - "$CFG" "$1" <<'PY'
+import json,os,sys
+cfg,val=sys.argv[1],sys.argv[2]
+d=json.load(open(cfg)) if os.path.exists(cfg) else {}
+if val=="remove": d.get("driver_vrlink",{}).pop("disableUberLink",None)
+else: d.setdefault("driver_vrlink",{})["disableUberLink"]=(val=="true")
+json.dump(d,open(cfg,"w"),indent=3)
+PY
+}
+
+title "vrlink Uber link (dual path)"
+
+case "$MODE" in
+  help)
+      sed -n '2,19p' "$0" | sed 's/^# \?//'
+      printf '\nAlternative key, if this one does nothing:\n'
+      printf '    driver_vrlink.allowMultipleLinks = false\n'
+      printf '\nAnother way to the same end, without undocumented keys: move the dongle\n'
+      printf 'interface into the trusted zone and drop %s/udp from the default\n' "$VRLINK_UDP"
+      printf 'zone, so the LAN path is bound but carries nothing.\n\n'
+      exit 0 ;;
+  check)
+      probe "driver_vrlink.$KEY in steamvr.vrsettings"
+      cur=$(get | tr -d '"')   # strip JSON quoting so comparisons work
+      cmp_state "$KEY" "$cur" "true" opt
+      probe "grep -E 'Uber link enabled|AddAndInitLinkTransfer' driver_vrlink.txt | tail"
+      if [[ -f "$L" ]]; then
+          uber=$(grep -c "Uber link enabled" "$L" 2>/dev/null | head -1)
+          binds=$(grep "AddAndInitLinkTransfer" "$L" 2>/dev/null | tail -4 | awk '{print $9}' | sort -u | tr '\n' ' ')
+          cmp_state "log says Uber link" "$([[ "${uber:-0}" -gt 0 ]] && echo enabled || echo not mentioned)" "not mentioned" opt
+          info "transports bound last start: ${binds:-none logged}"
+      else
+          info "no driver_vrlink.txt yet - start SteamVR once"
+      fi
+      [[ "$cur" == "unset" ]] && info "to try it:  ./scripts/$(basename "$0") --apply   (SteamVR must be closed)"
+      ;;
+  apply)
+      pgrep -x vrserver >/dev/null && { bad "close SteamVR first - settings are read at startup"; exit 1; }
+      info "sets driver_vrlink.$KEY = true in $CFG"
+      info "undocumented key; remove it with --restore if anything gets worse"
+      confirm "apply?" || { miss "cancelled"; exit 0; }
+      cp -n "$CFG" "$CFG.izovr-backup" 2>/dev/null || true
+      set_key true && ok "$KEY = true"
+      info "start SteamVR, then check the log:  ./scripts/$(basename "$0")"
+      ;;
+  restore)
+      pgrep -x vrserver >/dev/null && { bad "close SteamVR first"; exit 1; }
+      set_key remove && ok "$KEY removed - back to default behaviour"
+      ;;
+esac

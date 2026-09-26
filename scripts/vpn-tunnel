@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# SESSION SETTING. --apply stops the tunnel for VR, --restore brings it back.
+#
+# vrlink binds every interface it finds at startup, the WireGuard tunnel included
+# ("SVLDataLinkTransferUDP::Init 10.0.42.2 dev wg0-client 10400"). A hiccup on the
+# VPN side then cascades and kills the whole SteamVR session - issue 910.
+#
+# Measured on this machine: with the tunnel up, the session collapsed every 18
+# seconds ("Connection active" -> "Connection inactive" -> "All VTEs Invalidated")
+# and vrcompositor logged 324 VK_ERROR_DEVICE_LOST. With it stopped: zero of both.
+#
+# vrlink picks its transports at startup, so restart SteamVR after changing this.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+UNIT=wg-quick@wg0-client
+
+title "WireGuard tunnel (session)"
+
+case "$MODE" in
+  help) sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "systemctl is-active $UNIT"
+      st=$(systemctl is-active "$UNIT" 2>/dev/null)
+      cmp_state "tunnel" "${st:-unknown}" "inactive"
+      probe "grep SVLDataLinkTransferUDP::Init driver_vrlink.txt | tail -4"
+      L="$STEAM_ROOT/logs/driver_vrlink.txt"
+      if [[ -f "$L" ]]; then
+          binds=$(grep "SVLDataLinkTransferUDP::Init" "$L" 2>/dev/null | tail -4 | awk '{print $11" -> "$9}' | sort -u)
+          while IFS= read -r b; do
+              [[ -z "$b" ]] && continue
+              case "$b" in *wg*|*tun*|*tap*|*ppp*) bad "vrlink bound a tunnel: $b" ;; *) info "vrlink bound: $b" ;; esac
+          done <<< "$binds"
+      fi
+      [[ "$st" != inactive ]] && hint "$0"
+      ;;
+  apply)
+      info "sudo systemctl stop $UNIT   (this session only, comes back on reboot)"
+      confirm "stop the tunnel now?" || { miss "cancelled"; exit 0; }
+      sudo systemctl stop "$UNIT" && ok "stopped - now restart SteamVR so vrlink rebinds"
+      ;;
+  restore)
+      sudo systemctl start "$UNIT" && ok "tunnel back up"
+      ;;
+esac

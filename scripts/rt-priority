@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Real-time scheduling limit for the SteamVR encoder threads.
+#
+# Without it vrserver logs "vrlink: Failed to set thread priority: setschedparam
+# failed 15: 1" (EPERM) and the encoder threads run at normal priority. The
+# compositor, which does get RT priority via vrcompositor-launcher's cap_sys_nice,
+# then waits for frames that never arrive in time -> "WaitForAcquire timed out".
+# Measured impact: video stream resets dropped from 0.255/s to 0.036/s.
+#
+# SteamOS ships this limit by default; openSUSE does not.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+CONF=/etc/security/limits.d/99-steamvr-rtprio.conf
+USR="${SUDO_USER:-$USER}"
+PRIO=20   # vrlink asks for 15
+
+title "RT priority for encoder threads"
+cur=$(ulimit -r)
+denials=$(grep -c "Failed to set thread priority" "$STEAM_ROOT/logs/vrserver.txt" 2>/dev/null | head -1)
+
+case "$MODE" in
+  help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "ulimit -r"
+      cmp_state "rtprio ceiling" "$cur" ">= 15 (vrlink asks 15)" "$([[ "$cur" -ge 15 ]] && echo ok || echo miss)"
+      probe "grep -rlsE rtprio /etc/security/limits.conf /etc/security/limits.d/"
+      probe "grep DefaultLimitRTPRIO= /etc/systemd/system.conf{,.d/}"
+      src=$(grep -rlsE '^[^#]*rtprio' /etc/security/limits.conf /etc/security/limits.d/ 2>/dev/null | tr '\n' ' ')
+      sysd=$(grep -rhsE '^DefaultLimitRTPRIO=' /etc/systemd/system.conf /etc/systemd/system.conf.d/ 2>/dev/null | tail -1)
+      cmp_state "granted by" "${src:-${sysd:-nothing found}}" "any limits.d or systemd source" \
+          "$([[ -n "$src$sysd" ]] && echo ok || echo miss)"
+      [[ -z "$src$sysd" ]] && hint "$0"
+      probe "grep -c 'Failed to set thread priority' vrserver.txt"
+      [[ "${denials:-0}" -gt 0 ]] && info "priority denials in log: $denials (a few at startup are normal)"
+      ;;
+  apply)
+      if [[ -f "$CONF" ]]; then ok "already applied"; sed 's/^/    /' "$CONF"; exit 0; fi
+      info "will write $CONF:"
+      info "    $USR  -  rtprio  $PRIO"
+      info "    $USR  -  nice    -15"
+      info "rtprio $PRIO is a ceiling, not an assignment. Scoped to one user."
+      info "PAM applies limits at session start - YOU MUST LOG OUT AND BACK IN."
+      confirm "write it?" || { miss "cancelled"; exit 0; }
+      printf '%s  -  rtprio  %s\n%s  -  nice    -15\n' "$USR" "$PRIO" "$USR" | sudo tee "$CONF" >/dev/null
+      ok "written - log out and back in, then check with: ./scripts/rt-priority"
+      ;;
+  restore)
+      [[ -f "$CONF" ]] || { ok "nothing to restore"; exit 0; }
+      confirm "remove $CONF?" || exit 0
+      sudo rm -f "$CONF" && ok "removed - log out and back in"
+      ;;
+esac

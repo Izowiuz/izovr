@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# SESSION SETTING. Fixes the audio crackle heard only inside the headset.
+#
+# How it was isolated:
+#   Alyx -> PC headphones          44.1 kHz    clean
+#   Firefox -> headset via vrlink    48 kHz    clean
+#   Alyx -> headset via vrlink     44.1 -> 48  CRACKLES
+#
+# Neither the game nor the transport is at fault: it is the forced resample.
+# hlvr plays at 44100, vrlink-sink is fixed at 48000, and PipeWire runs with
+# clock.allowed-rates = [ 48000 ] so the graph cannot follow the game.
+#
+# Two levers, and BOTH are needed. Measured: the larger quantum alone reduces
+# the crackle but does not clear it; forcing the rate clears it completely.
+#
+# COST: forcing the rate changes the whole system audio graph, and vrlink-sink
+# (fixed at 48000) gets resampled instead. That is suspected of making video
+# worse - resets went 0.100/s to 0.48/s in one long session, but that was not a
+# clean A/B, so treat it as unproven.
+#
+# pw-metadata values are RUNTIME ONLY - lost when PipeWire restarts and on every
+# reboot. --persist writes a drop-in so they survive; the global cost above then
+# applies permanently, which is why it is a separate mode and not the default.
+#
+# PER-GAME HINT DOES NOT SOLVE IT - measured 26.09 with the game running:
+#     PIPEWIRE_LATENCY=1024/48000 PIPEWIRE_RATE=1/48000 %command%
+#   -> pw-top shows  QUANT 1024  RATE 48000  but  FORMAT F32LE 2 44100
+# PIPEWIRE_RATE changes the rate the node is scheduled at, not the format the
+# application produces. The resample still happens, just inside the node. An
+# earlier crackle-free session led to the opposite conclusion; that was based on
+# hearing, not on a measurement, and was wrong.
+#
+# Always verify with the FORMAT column, not the RATE column:
+#     pw-top -b -n 2 | grep hlvr
+#
+# Untried next candidate, aimed at the resampler itself rather than avoiding it:
+#     PIPEWIRE_PROPS='{ resample.quality = 10 }' %command%      (default is 4)
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+QUANTUM=2048
+RATE=44100
+
+fq() { pw-metadata -n settings 2>/dev/null | awk -F\' '/force-quantum/{print $4}'; }
+fr() { pw-metadata -n settings 2>/dev/null | awk -F\' '/force-rate/{print $4}'; }
+
+DROPIN="$HOME/.config/pipewire/pipewire.conf.d/50-izovr-steamframe.conf"
+[[ "${1:-}" == "--persist" ]] && MODE=persist
+
+title "PipeWire resample (headset audio crackle)"
+
+case "$MODE" in
+  help)
+      sed -n '2,25p' "$0" | sed 's/^# \?//'
+      printf '\nPer-game alternative, Steam > Half-Life: Alyx > Launch Options:\n'
+      printf '    PIPEWIRE_LATENCY=1024/44100 %%command%%\n'
+      printf '        larger buffer for this game only - reduces, does not clear\n'
+      printf '    PIPEWIRE_LATENCY=1024/48000 PIPEWIRE_RATE=1/48000 %%command%%\n'
+      printf '        tries to make the game output 48000 so nothing resamples.\n'
+      printf '        UNTESTED - the app may ignore the hint. Verify with:\n'
+      printf '        pw-top -b -n 2 | grep hlvr   (should read 48000, not 44100)\n\n'
+      printf 'Modes: --apply (this session)  --persist (survives reboot)  --restore\n\n'
+      exit 0 ;;
+  check)
+      probe "pw-metadata -n settings | grep -E 'force-quantum|force-rate'"
+      q=$(fq); r=$(fr)
+      cmp_state "force-quantum" "${q:-0} $([[ "${q:-0}" == 0 ]] && echo '(unset)')" "$QUANTUM"
+      cmp_state "force-rate"    "${r:-0} $([[ "${r:-0}" == 0 ]] && echo '(unset)')" "$RATE"
+      probe "test -f $DROPIN"
+      cmp_state "persistent drop-in" "$([[ -f "$DROPIN" ]] && echo present || echo absent)" "present" opt
+      if [[ "${q:-0}" == "$QUANTUM" && "${r:-0}" == "$RATE" ]]; then
+          ok "both levers active - crackle should be gone"
+      elif [[ "${q:-0}" != 0 || "${r:-0}" != 0 ]]; then
+          miss "only one lever set - known to reduce but not clear the crackle"; hint "$0"
+      else
+          miss "nothing set - audio will crackle inside the headset"; hint "$0"
+      fi
+      probe "pw-top -b -n 2, nodes hlvr and vrlink-sink"
+      timeout 8 pw-top -b -n 2 2>/dev/null | grep -E "hlvr|vrlink-sink" | tail -2 | sed 's/^/    /' || true
+      ;;
+  apply)
+      info "pw-metadata -n settings 0 clock.force-quantum $QUANTUM"
+      info "pw-metadata -n settings 0 clock.force-rate $RATE"
+      info ""
+      info "The rate is global: all system audio moves to $RATE Hz and vrlink-sink"
+      info "gets resampled instead. Suspected of hurting video, not proven."
+      info "Undo either way with: $0 --restore"
+      confirm "apply both?" || { miss "cancelled"; exit 0; }
+      pw-metadata -n settings 0 clock.force-quantum "$QUANTUM" >/dev/null && ok "quantum $QUANTUM"
+      pw-metadata -n settings 0 clock.force-rate "$RATE" >/dev/null && ok "rate $RATE"
+      ;;
+  persist)
+      info "writes $DROPIN with force-quantum $QUANTUM and force-rate $RATE"
+      info "This makes the GLOBAL rate change permanent. Only do this if you have"
+      info "decided the trade-off is acceptable - the per-game route in --help avoids it."
+      confirm "persist?" || { miss "cancelled"; exit 0; }
+      mkdir -p "$(dirname "$DROPIN")"
+      cat > "$DROPIN" <<'DROPEOF'
+# izovr: headset audio crackles because hlvr plays 44100 while vrlink-sink is
+# fixed at 48000 and the graph only allows 48000, forcing a resample.
+# Details: ./scripts/pipewire-resample --help
+context.properties = {
+    default.clock.force-quantum = 2048
+    default.clock.force-rate    = 44100
+}
+DROPEOF
+      ok "written - apply now with: systemctl --user restart pipewire pipewire-pulse wireplumber"
+      ;;
+  restore)
+      [[ -f "$DROPIN" ]] && { confirm "also remove $DROPIN?" && rm -f "$DROPIN" && ok "drop-in removed"; }
+      pw-metadata -n settings 0 clock.force-quantum 0 >/dev/null && ok "quantum cleared"
+      pw-metadata -n settings 0 clock.force-rate 0 >/dev/null && ok "rate cleared"
+      ;;
+esac
