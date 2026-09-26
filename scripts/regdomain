@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Wireless regulatory domain. Without a country set, the kernel sits in domain
+# "00" (world), where the 6 GHz band is forbidden entirely - and the Steam Frame
+# dedicated link runs only on 6 GHz.
+#
+# Symptom when missing: the dongle hangs in "connecting (configuring)" forever,
+# a scan shows no frequency above 5925 MHz, and the headset's "Pair wireless
+# adapter" spins and returns. After setting PL: 118 channels became available
+# and the link came up at 6135 MHz, 160 MHz HE, -44 dBm.
+#
+# Pass a country code as the first argument (default PL). This declares where the
+# machine actually is; it is a legal setting, not a workaround.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+CC="PL"
+for a in "$@"; do [[ "$a" =~ ^[A-Z]{2}$ ]] && CC="$a"; done
+MODCONF=/etc/modprobe.d/99-cfg80211-regdom.conf
+SYSCONF=/etc/sysconfig/network/config
+
+title "Regulatory domain (6 GHz gate)"
+
+case "$MODE" in
+  help) sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      if ! have iw; then bad "iw not installed - cannot read or set the domain"; hint "$0"; exit 0; fi
+      probe "iw reg get"
+      reg=$(iw reg get 2>/dev/null | awk '/^country/{print $2; exit}' | tr -d ':')
+      cmp_state "domain" "${reg:-00}" "any country, not 00" "$([[ -n "$reg" && "$reg" != 00 ]] && echo ok || echo miss)"
+      probe "iw list, frequencies within 5925-7125 MHz"
+      n6=$(iw list 2>/dev/null | awk '/\* [0-9]+(\.[0-9]+)? MHz/{gsub(/\*|MHz/,""); if ($1+0>=5925 && $1+0<=7125) c++} END{print c+0}')
+      cmp_state "6 GHz channels" "$n6" "> 0" "$([[ "$n6" -gt 0 ]] && echo ok || echo miss)"
+      [[ "$n6" -eq 0 ]] && hint "$0"
+      probe "grep -rlsE ieee80211_regdom /etc/modprobe.d/"
+      probe "grep WIRELESS_REGULATORY_DOMAIN $SYSCONF"
+      src=$(grep -rlsE 'ieee80211_regdom' /etc/modprobe.d/ 2>/dev/null | tr '\n' ' ')
+      distro=$(grep -hsE '^WIRELESS_REGULATORY_DOMAIN="[A-Z][A-Z]"' "$SYSCONF" 2>/dev/null)
+      cmp_state "persisted by" "${src:-${distro:-nothing found}}" "modprobe.d or distro knob" \
+          "$([[ -n "$src$distro" ]] && echo ok || echo miss)"
+      ;;
+  apply)
+      info "country: $CC   (pass another code as argument if wrong)"
+      info "1. zypper install iw          (if missing)"
+      info "2. iw reg set $CC             (immediate)"
+      info "3. $MODCONF   -> options cfg80211 ieee80211_regdom=$CC"
+      info "4. $SYSCONF   -> WIRELESS_REGULATORY_DOMAIN=\"$CC\"  (backup kept)"
+      confirm "apply?" || { miss "cancelled"; exit 0; }
+      have iw || sudo zypper --non-interactive install iw || { bad "iw install failed"; exit 1; }
+      run_priv "iw reg set $CC" "" sudo iw reg set "$CC"
+      if printf 'options cfg80211 ieee80211_regdom=%s\n' "$CC" | sudo tee "$MODCONF" >/dev/null; then
+          ok "$MODCONF"
+      else
+          priv_failed "" "printf 'options cfg80211 ieee80211_regdom=$CC' | sudo tee $MODCONF"
+      fi
+      if [[ -f "$SYSCONF" ]]; then
+          sudo cp -n "$SYSCONF" "$SYSCONF.izovr-backup"
+          run_priv "$SYSCONF" "" sudo sed -i "s|^WIRELESS_REGULATORY_DOMAIN=.*|WIRELESS_REGULATORY_DOMAIN=\"$CC\"|" "$SYSCONF"
+      fi
+      n6=$(iw list 2>/dev/null | awk '/\* [0-9]+(\.[0-9]+)? MHz/{gsub(/\*|MHz/,""); if ($1+0>=5925 && $1+0<=7125) c++} END{print c+0}')
+      [[ "$n6" -gt 0 ]] && ok "6 GHz channels now: $n6" || bad "still 0 channels - reload the module or reboot"
+      ;;
+  restore)
+      confirm "remove regulatory domain settings?" || exit 0
+      run_priv "$MODCONF removed" "" sudo rm -f "$MODCONF"
+      info "clear WIRELESS_REGULATORY_DOMAIN in $SYSCONF by hand, then reboot"
+      ;;
+esac

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Video encoder depth for the vrlink stream.
+#
+# driver_vrlink defaults to 10bit = true. On this host the compositor then logs:
+#     vkGetPhysicalDeviceFormatProperties2 returned zero modifiers
+#     for DRM format 0x30313050
+# 0x30313050 is "P010", the 10-bit YUV format. Zero modifiers means the Vulkan
+# driver does not expose that format for this path, so the encoder asks for
+# something it cannot get. Observed alongside repeated vrserver, vrcompositor
+# and vrmonitor crashes on 26.09.
+#
+# TESTED 26.09 AND NOT WORTH IT. With 10bit = false the encoder does switch to
+# 8-bit NV12 (log: "format: 1000156003" = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM), but:
+#   resets          0.100/s -> 0.097/s   (no change)
+#   P010 rejections 6-10    -> 2         (still there: the compositor probes that
+#                                         format regardless of this setting, so
+#                                         blaming the encoder for it was wrong)
+#   image           visibly much brighter, washed-out blacks - most likely a
+#                   limited/full colour range mismatch after the format change
+# Keep the default (10-bit) unless a future measurement argues otherwise. The
+# crashes seen the same evening turned out to have other causes: a game launched
+# under Proton with no HMD connected, and a stale vrserver holding the IPC socket.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+CFG="$STEAM_ROOT/config/steamvr.vrsettings"
+C="$STEAM_ROOT/logs/vrcompositor.txt"
+
+get() { python3 -c "
+import json,os
+d=json.load(open('$CFG')) if os.path.exists('$CFG') else {}
+v=d.get('driver_vrlink',{}).get('10bit','unset')
+print('unset (default true)' if v=='unset' else str(v).lower())" 2>/dev/null; }
+
+set_key() { python3 - "$CFG" "$1" <<'PY'
+import json,os,sys
+cfg,val=sys.argv[1],sys.argv[2]
+d=json.load(open(cfg)) if os.path.exists(cfg) else {}
+if val=="remove": d.get("driver_vrlink",{}).pop("10bit",None)
+else: d.setdefault("driver_vrlink",{})["10bit"]=(val=="true")
+json.dump(d,open(cfg,"w"),indent=3)
+PY
+}
+
+title "vrlink encoder bit depth"
+
+case "$MODE" in
+  help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "driver_vrlink.10bit in steamvr.vrsettings"
+      cmp_state "10bit" "$(get)" "false"
+      probe "grep 'zero modifiers for DRM format 0x30313050' vrcompositor.txt"
+      n=$(grep -c "zero modifiers for DRM format 0x30313050" "$C" 2>/dev/null | head -1)
+      cmp_state "P010 rejections" "${n:-0}" "0" "$([[ "${n:-0}" -eq 0 ]] && echo ok || echo miss)"
+      [[ "${n:-0}" -gt 0 ]] && info "the encoder is asking for a 10-bit format the driver will not give it"
+      [[ "$(get)" != false ]] && hint "$0"
+      ;;
+  apply)
+      steamvr_running && { bad "close SteamVR first - settings are read at startup"; exit 1; }
+      info "sets driver_vrlink.10bit = false in $CFG"
+      confirm "apply?" || { miss "cancelled"; exit 0; }
+      cp -n "$CFG" "$CFG.izovr-backup" 2>/dev/null || true
+      set_key false && ok "10bit = false"
+      ;;
+  restore)
+      steamvr_running && { bad "close SteamVR first"; exit 1; }
+      set_key remove && ok "back to default (10bit true)"
+      ;;
+esac

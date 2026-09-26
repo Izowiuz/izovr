@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# SESSION SETTING. --apply stops the tunnel for VR, --restore brings it back.
+#
+# vrlink binds every interface it finds at startup, the WireGuard tunnel included
+# ("SVLDataLinkTransferUDP::Init 10.0.42.2 dev wg0-client 10400"). A hiccup on the
+# VPN side then cascades and kills the whole SteamVR session - issue 910.
+#
+# Measured on this machine: with the tunnel up, the session collapsed every 18
+# seconds ("Connection active" -> "Connection inactive" -> "All VTEs Invalidated")
+# and vrcompositor logged 324 VK_ERROR_DEVICE_LOST. With it stopped: zero of both.
+#
+# vrlink picks its transports at startup, so restart SteamVR after changing this.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+UNIT=wg-quick@wg0-client
+
+title "WireGuard tunnel (session)"
+
+case "$MODE" in
+  help) sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "systemctl is-active $UNIT"
+      st=$(systemctl is-active "$UNIT" 2>/dev/null)
+      cmp_state "tunnel" "${st:-unknown}" "inactive"
+      # The log only says what vrlink bound when it last started. That is history,
+      # not current state: after the tunnel is stopped the lines stay in the file.
+      # So each binding is checked against the interface actually existing now, and
+      # against SteamVR still running - otherwise a finished session reads as a fault.
+      probe "grep SVLDataLinkTransferUDP::Init driver_vrlink.txt | tail -4  (+ /sys/class/net)"
+      L="$STEAM_ROOT/logs/driver_vrlink.txt"
+      live_tunnel=0
+      if [[ -f "$L" ]]; then
+          steamvr_running && vr=running || vr=stopped
+          when=$(grep "SVLDataLinkTransferUDP::Init" "$L" 2>/dev/null | tail -1 | awk '{print $2" "$3", "$5}' | cut -d. -f1)
+          [[ -n "$when" ]] && info "last bound at $when, SteamVR now $vr"
+          binds=$(grep "SVLDataLinkTransferUDP::Init" "$L" 2>/dev/null | tail -4 | awk '{print $11"|"$9}' | sort -u)
+          while IFS='|' read -r iface addr; do
+              [[ -z "$iface" ]] && continue
+              if [[ ! -e "/sys/class/net/$iface" ]]; then
+                  info "vrlink bound: $iface -> $addr   (gone since - stale log line)"
+                  continue
+              fi
+              case "$iface" in
+                  *wg*|*tun*|*tap*|*ppp*)
+                      if [[ "$vr" == running ]]; then
+                          bad "vrlink bound a tunnel: $iface -> $addr   (live)"
+                          live_tunnel=1
+                      else
+                          info "vrlink bound a tunnel: $iface -> $addr   (interface still up, but SteamVR is not - rebinds on next start)"
+                      fi ;;
+                  *)  info "vrlink bound: $iface -> $addr" ;;
+              esac
+          done <<< "$binds"
+      fi
+      { [[ "$st" != inactive ]] || (( live_tunnel )); } && hint "$0"
+      ;;
+  apply)
+      info "sudo systemctl stop $UNIT   (this session only, comes back on reboot)"
+      confirm "stop the tunnel now?" || { miss "cancelled"; exit 0; }
+      run_priv "stopped - now restart SteamVR so vrlink rebinds" "The tunnel is still active." \
+          sudo systemctl stop "$UNIT"
+      ;;
+  restore)
+      run_priv "tunnel back up" "The tunnel is still inactive." \
+          sudo systemctl start "$UNIT"
+      ;;
+esac

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Restrict SteamVR's Vulkan loader to the NVIDIA driver.
+#
+# Why: vrcompositor crashed with SIGSEGV three times in one evening, and the core
+# dump showed threads in TWO Vulkan drivers at once - libvulkan_radeon.so (the
+# Raphael iGPU) next to libnvidia-glcore.so. This machine exposes three Vulkan
+# devices (RTX 5080, RADV iGPU, llvmpipe); the video encoder has no business
+# seeing the last two. Measured: resets 0.433/s -> 0.255/s, GPU 57% -> 50%.
+#
+# This is a Steam launch option, not a file we own. Steam rewrites localconfig.vdf
+# and would overwrite our edit, so this script only checks and prints the string.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+ICD=/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json
+OPT="VK_DRIVER_FILES=$ICD WAYLAND_DISPLAY= %command%"
+
+title "GPU isolation for SteamVR"
+
+case "$MODE" in
+  help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  apply|restore)
+      info "cannot be applied from here - Steam owns this setting and would overwrite it."
+      info "Steam > Library > SteamVR > Properties > Launch Options:"
+      printf '\n      %s\n\n' "$OPT"
+      info "The WAYLAND_DISPLAY= part forces XWayland; SteamVR renders artifacts on native Wayland."
+      [[ "$MODE" == restore ]] && info "to undo: clear the launch options field"
+      ;;
+  check)
+      probe "test -f $ICD"
+      cmp_state "NVIDIA ICD file" "$([[ -f "$ICD" ]] && echo present || echo missing)" "present"
+      probe "grep -rs VK_DRIVER_FILES $STEAM_USERDATA"
+      lo=$(grep -rqs VK_DRIVER_FILES "$STEAM_USERDATA" && echo set || echo unset)
+      cmp_state "launch option" "$lo" "set"
+      [[ "$lo" == set ]] || info "run: ./scripts/gpu-isolation --apply   (prints what to paste)"
+      pids=$(steamvr_pids)
+      if [[ -z "$pids" ]]; then
+          info "SteamVR not running - start it to verify the live processes"
+      else
+          probe "grep libvulkan_{radeon,intel,lvp}.so /proc/<pid>/maps"
+          for pid in $pids; do
+              nm=$(basename "$(tr '\0' '\n' < /proc/$pid/cmdline 2>/dev/null | head -1)")
+              foreign=$(grep -oE "libvulkan_(radeon|intel|lvp)\.so" /proc/$pid/maps 2>/dev/null | sort -u | tr '\n' ' ')
+              cmp_state "$nm drivers" "${foreign:-NVIDIA only}" "NVIDIA only" \
+                  "$([[ -z "$foreign" ]] && echo ok || echo miss)"
+          done
+      fi
+      ;;
+esac

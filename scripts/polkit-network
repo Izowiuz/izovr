@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Stop the root password prompt that appears roughly once a minute.
+#
+# Steam stores the dongle pairing state in the SYSTEM NetworkManager profile
+# "Steam Frame Wireless Adapter". openSUSE requires admin authentication for
+# org.freedesktop.NetworkManager.settings.modify.system, so every retry of Steam's
+# 60-second dongle loop pops a password dialog. Measured 25.09: 8 prompts, gaps of
+# 40, 47, 45 and 59 seconds.
+#
+# The rule below is deliberately narrow: one action, one user, local and active
+# sessions only. You already have sudo, so this removes a prompt rather than
+# granting new power.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+RULE=/etc/polkit-1/rules.d/50-izovr-steamframe-nm.rules
+ACTION="org.freedesktop.NetworkManager.settings.modify.system"
+USR="${SUDO_USER:-$USER}"
+
+title "Polkit rule for NetworkManager"
+
+case "$MODE" in
+  help) sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "pkcheck --action-id $ACTION --process \$\$"
+      verdict=no
+      have pkcheck && pkcheck --action-id "$ACTION" --process $$ >/dev/null 2>&1 && verdict=yes
+      probe "grep -rls $ACTION /etc/polkit-1/rules.d/ /etc/polkit-1/localauthority/"
+      src=$(grep -rls "$ACTION" /etc/polkit-1/rules.d/ /etc/polkit-1/localauthority/ 2>/dev/null | tr '\n' ' ')
+      # NetworkManager's policy is auth_admin_keep: once you type the password polkit
+# caches the grant for a while, so "yes" here can simply mean "you authenticated
+# recently". Only a rule file makes it permanent.
+if [[ "$verdict" == yes && -z "$src" ]]; then
+    cmp_state "authorised now" "yes (cached grant, expires)" "yes (by rule)" miss
+    info "polkit remembers your last password entry; the prompt will come back"
+else
+    cmp_state "authorised now" "$verdict" "yes"
+fi
+      cmp_state "rule source" "${src:-nothing found}" "a file under rules.d" \
+          "$([[ -n "$src" ]] && echo ok || echo miss)"
+      if [[ "$verdict" != yes && -z "$src" ]]; then
+          probe "journalctl --user | grep Password prompts"
+          n=$(journalctl --user --since today --no-pager 2>/dev/null | grep -c 'Request:  "Password: "')
+          [[ "${n:-0}" -gt 0 ]] && info "password prompts logged today: $n"
+          hint "$0"
+      fi
+      ;;
+  apply)
+      info "$RULE will allow, without a password:"
+      info "    action  $ACTION"
+      info "    user    $USR"
+      info "    only    subject.local && subject.active"
+      info "Nothing else: no other actions, no other users, no remote sessions."
+      confirm "write the rule?" || { miss "cancelled"; exit 0; }
+      sudo tee "$RULE" >/dev/null <<RULEEOF
+// izovr: Steam stores Steam Frame dongle pairing in the system NM profile and
+// re-saves it on every retry, which otherwise prompts for a password every minute.
+polkit.addRule(function(action, subject) {
+    if (action.id == "$ACTION" &&
+        subject.user == "$USR" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});
+RULEEOF
+      [[ $? -eq 0 ]] || priv_failed "" "sudo tee $RULE"
+      run_priv "written - effective immediately, no logout needed" "" sudo chmod 644 "$RULE"
+      ;;
+  restore)
+      [[ -f "$RULE" ]] || { ok "nothing to restore"; exit 0; }
+      confirm "remove $RULE?" || exit 0
+      run_priv "removed" "" sudo rm -f "$RULE"
+      ;;
+esac

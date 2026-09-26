@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Read-only snapshot of the VR stack: install, runtimes, link, recent errors.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+V="$STEAM_ROOT/steamapps/common/SteamVR"
+D=$(dongle_iface)
+
+title "SteamVR install"
+[[ -f "$V/bin/linux64/vrserver" ]] && ok "vrserver present" || bad "vrserver missing"
+[[ -f "$V/steamxr_linux64.json" ]] && ok "OpenXR manifest present" || miss "no steamxr_linux64.json"
+for d in "$V"/drivers/frame_hmd "$V"/drivers/vrlink; do
+    [[ -d "$d" ]] && ok "driver: $(basename "$d")" || bad "driver missing: $(basename "$d")"
+done
+[[ -e "$HOME/.config/openxr/1/active_runtime.json" ]] && ok "active OpenXR runtime -> $(readlink -f "$HOME/.config/openxr/1/active_runtime.json" | sed 's|.*/||')" || miss "no active OpenXR runtime"
+
+title "Processes"
+if steamvr_running; then
+    steamvr_procs | awk '{print "  running: "$2}'
+else
+    info "SteamVR not running. Note: Steam will NOT start it for you (issue 962) -"
+    info "launch SteamVR by hand before starting a VR game."
+fi
+
+title "Link to headset"
+if [[ -n "$D" ]]; then
+    st=$(nmcli -t -f DEVICE,STATE dev status | grep "^$D:" | cut -d: -f2)
+    case "$st" in
+        connected) ok "$D connected to the headset" ;;
+        disconnected) miss "$D ready, link idle - the headset starts the session" ;;
+        *) bad "$D state: $st" ;;
+    esac
+    # A USB 3 socket is wired to BOTH root hubs of its controller - the 2.0 pins to
+    # one, the SuperSpeed pins to the other - and each hub numbers its ports on its
+    # own. So the interface name (wlp<bus>s<slot>u<PORT>) can change without anyone
+    # touching the dongle, and it never says which hub answered. A High Speed
+    # enumeration is the one that matters: the radio negotiates over 1 Gbit/s, which
+    # 480 Mb/s cannot carry, and nothing in the link state shows the bottleneck.
+    probe "/sys/class/net/$D/device -> USB bus speed"
+    usbdev=$(readlink -f "/sys/class/net/$D/device" 2>/dev/null)
+    spd=$(cat "${usbdev%/*}/speed" 2>/dev/null)
+    case "$spd" in
+        "")            info "USB link speed unreadable" ;;
+        5000|10000|20000) cmp_state "USB speed" "$spd Mb/s (SuperSpeed)" "5000 or more" ok ;;
+        *)             cmp_state "USB speed" "$spd Mb/s" "5000 or more" miss
+                       info "High Speed enumeration - far below what the radio is negotiating."
+                       info "Unplug and replug the dongle, ideally into a different socket." ;;
+    esac
+    iw dev "$D" link 2>/dev/null | grep -E "SSID|freq|signal|tx bitrate" | sed 's/^\s*/    /'
+    iw dev "$D" station dump 2>/dev/null | grep -iE "tx retries|tx failed|beacon loss" | sed 's/^\s*/    /'
+    info "all-zero retry counters usually mean the driver does not implement them"
+else
+    miss "dongle not plugged in"
+fi
+RC="$STEAM_ROOT/logs/remote_connections.txt"
+[[ -f "$RC" ]] && { ip=$(grep "broadcast message from client" "$RC" | tail -1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1); [[ -n "$ip" ]] && ok "headset seen at $ip"; }
+
+title "Recent errors"
+for f in vrserver.txt vrcompositor.txt; do
+    p="$STEAM_ROOT/logs/$f"; [[ -f "$p" ]] || continue
+    n=$(grep -c "WaitForAcquire timed out" "$p" 2>/dev/null | head -1)
+    s=$(grep -oE "\[[0-9]+ messages suppressed\]" "$p" 2>/dev/null | tail -1)
+    [[ "$f" == vrcompositor.txt ]] && info "WaitForAcquire timeouts: ${n:-0} ${s:-}"
+done
+info "count resets per session with: ./scripts/measure 180"

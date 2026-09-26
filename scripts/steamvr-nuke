@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Close every process of the SteamVR app, including its Steam wrappers.
+#
+# Steam keeps the STOP button lit while the reaper it started is alive.
+# To kill only the binaries under SteamVR/bin/linux64 leaves that reaper running.
+#
+# This script does not use `pkill -f`. That command compares command lines.
+# It also kills a shell whose arguments mention SteamVR.
+# This script reads /proc/<pid>/exe and the AppId, then walks the process tree.
+# It always spares itself and its own parents.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+APPID=250820
+
+title "SteamVR processes"
+
+# PPid comes from /proc/<pid>/status, not from field 4 of stat: a process name
+# may contain spaces and parentheses, which shifts every field of that line.
+ppid_of() { sed -n 's/^PPid:[[:space:]]*//p' "/proc/$1/status" 2>/dev/null; }
+
+spared() {
+    local p=$$
+    while [[ -n "$p" && "$p" != 0 ]]; do
+        echo "$p"; p=$(ppid_of "$p")
+    done
+}
+
+seeds() {
+    local d pid exe cl
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        exe=$(readlink -f "$d/exe" 2>/dev/null)
+        case "$exe" in */SteamVR/bin/linux64/*) echo "$pid"; continue ;; esac
+        # The process can exit between the glob and this read. The shell reports a
+        # failed input redirection itself, so stderr must be closed around the
+        # whole group: a trailing 2>/dev/null arrives too late to catch it.
+        cl=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null )
+        case "$cl" in *"AppId=$APPID"*) echo "$pid" ;; esac
+    done
+}
+
+tree() {
+    local keep seed out n
+    keep=" $(spared | tr '\n' ' ') "
+    out=$(seeds | sort -un)
+    while :; do
+        n=$(for d in /proc/[0-9]*; do
+                pid=${d#/proc/}
+                ppid=$(ppid_of "$pid") || continue
+                [[ -n "$ppid" ]] && grep -qx "$ppid" <<< "$out" && echo "$pid"
+            done)
+        n=$(printf '%s\n%s\n' "$out" "$n" | grep -v '^$' | sort -un)
+        [[ "$n" == "$out" ]] && break
+        out="$n"
+    done
+    for pid in $out; do
+        [[ "$keep" == *" $pid "* ]] && continue
+        [[ -r "/proc/$pid/stat" ]] || continue
+        nm=$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
+        # pressure-vessel runs some helpers where /proc/<pid>/exe is unreadable
+        # from outside its namespace; comm still names them.
+        [[ -z "$nm" ]] && nm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        echo "$pid ${nm:-?}"
+    done
+}
+
+case "$MODE" in
+  help) sed -n '2,10p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "/proc/<pid>/exe and AppId=$APPID in /proc/<pid>/cmdline"
+      found=$(tree)
+      if [[ -z "$found" ]]; then
+          ok "No SteamVR process runs."
+      else
+          echo "$found" | while read -r pid nm; do info "$pid ${nm:-?}"; done
+          info "to close these:  $0 --apply"
+      fi
+      ;;
+  apply)
+      info "This option closes every SteamVR process."
+      info "Start SteamVR again after this. vrlink selects its transports at startup."
+      found=$(tree)
+      [[ -z "$found" ]] && { ok "No SteamVR process runs."; exit 0; }
+      echo "$found" | while read -r pid nm; do info "$pid ${nm:-?}"; done
+      confirm "close $(wc -l <<< "$found") processes?" || { miss "cancelled"; exit 0; }
+
+      while read -r pid nm; do kill -TERM "$pid" 2>/dev/null; done <<< "$found"
+      for _ in $(seq 8); do [[ -z "$(tree)" ]] && break; sleep 1; done
+
+      left=$(tree)
+      if [[ -n "$left" ]]; then
+          info "Some processes ignore SIGTERM. The script sends SIGKILL."
+          while read -r pid nm; do kill -KILL "$pid" 2>/dev/null; done <<< "$left"
+          sleep 2
+      fi
+
+      left=$(tree)
+      if [[ -z "$left" ]]; then
+          ok "all SteamVR processes stopped"
+      else
+          bad "Some processes still run. Check them with ps."
+          echo "$left" | while read -r pid nm; do info "$pid ${nm:-?}"; done
+      fi
+      ;;
+  restore) miss "nothing to restore - start SteamVR from Steam" ;;
+esac
