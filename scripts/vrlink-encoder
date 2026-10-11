@@ -20,6 +20,14 @@
 # Keep the default (10-bit) unless a future measurement argues otherwise. The
 # crashes seen the same evening turned out to have other causes: a game launched
 # under Proton with no HMD connected, and a stale vrserver holding the IPC socket.
+#
+# The setting stayed at false after that test by mistake. TESTED AGAIN 11.10 with
+# the default (10-bit), on both paths:
+#   Half-Life: Alyx, native     image normal and good
+#   DCS World, Proton           image normal and good
+# Earlier sessions saw native and Proton games react to this switch in opposite
+# ways, so a change here needs a check on both paths. 10-bit stays.
+# The Alyx exit during that test was its usual GetBitRange assert, not this.
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
@@ -45,25 +53,25 @@ PY
 title "vrlink encoder bit depth"
 
 case "$MODE" in
-  help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  help) sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 0 ;;
   check)
       probe "driver_vrlink.10bit in steamvr.vrsettings"
-      cmp_state "10bit" "$(get)" "false"
+      cmp_state "10bit" "$(get)" "unset (default true)"
       probe "grep 'zero modifiers for DRM format 0x30313050' vrcompositor.txt"
       n=$(grep -c "zero modifiers for DRM format 0x30313050" "$C" 2>/dev/null | head -1)
       cmp_state "P010 rejections" "${n:-0}" "0" "$([[ "${n:-0}" -eq 0 ]] && echo ok || echo miss)"
       [[ "${n:-0}" -gt 0 ]] && info "the encoder is asking for a 10-bit format the driver will not give it"
-      [[ "$(get)" != false ]] && hint "$0"
+      if [[ "$(get)" != "unset (default true)" ]]; then hint "$0"; fi
       ;;
   apply)
       steamvr_running && { bad "close SteamVR first - settings are read at startup"; exit 1; }
-      info "sets driver_vrlink.10bit = false in $CFG"
+      info "The script removes driver_vrlink.10bit from steamvr.vrsettings. vrlink then uses 10-bit."
       confirm "apply?" || { miss "cancelled"; exit 0; }
       cp -n "$CFG" "$CFG.izovr-backup" 2>/dev/null || true
-      set_key false && ok "10bit = false"
+      set_key remove && ok "10bit removed, default true"
       ;;
   restore)
       steamvr_running && { bad "close SteamVR first"; exit 1; }
-      set_key remove && ok "back to default (10bit true)"
+      set_key false && ok "10bit = false"
       ;;
 esac

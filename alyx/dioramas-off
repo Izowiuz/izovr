@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Disable the loading screen dioramas in Half-Life: Alyx.
+# A diorama is a 3D view of City 17 on a loading screen.
+# SteamVR can crash when it loads a diorama at a level change.
+# Without the dioramas, a loading screen shows an empty grey space.
+# Press the trigger when the chime sounds. The game then continues.
+# The folder stays on disk under a different name.
+# Steam verification of the game files downloads the dioramas again.
+set -uo pipefail
+source "$(dirname "$0")/common.sh"
+
+# Source: a post on r/HalfLife ("Fix for HL:Alyx Linux load screen crashes"),
+# which renames only models/ui/dioramas. ProtonDB renames the whole models/ui,
+# which also takes map_hologram_steamvr with it; this keeps that one in place.
+# The crash it targets is SteamVR's, not the game's: vrcompositor at level loads,
+# SteamVR-for-Linux #944. One commenter on the post saw no change.
+
+UI="$ALYX_GAME/hlvr/models/ui"
+ON="$UI/dioramas"
+OFF="$UI/dioramas.izovr-off"
+
+title "models/ui/dioramas"
+
+state() {
+    if   [[ -d "$ON" ]];  then echo "enabled"
+    elif [[ -d "$OFF" ]]; then echo "disabled"
+    else                       echo "not found"
+    fi
+}
+both() { [[ -d "$ON" && -d "$OFF" ]]; }
+
+case "$MODE" in
+  help) sed -n '2,8p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "test -d $ON ; test -d $OFF"
+      st=$(state)
+      cmp_state "dioramas" "$st" "disabled"
+      both && info "Steam restored the dioramas. The disabled copy also exists."
+      [[ "$st" == "enabled" ]] && ! both && hint "$0"
+      ;;
+  apply)
+      alyx_running && { bad "Half-Life: Alyx runs. Close the game first."; exit 1; }
+      both && { bad "Steam restored the dioramas. The disabled copy also exists."; exit 1; }
+      st=$(state)
+      [[ "$st" == "disabled" ]] && { ok "The dioramas are already disabled."; exit 0; }
+      [[ "$st" == "enabled" ]] || { cmp_state "dioramas" "$st" "disabled"; exit 1; }
+      confirm "disable the dioramas?" || { miss "cancelled"; exit 0; }
+      if mv -n "$ON" "$OFF" && [[ "$(state)" == "disabled" ]]; then
+          ok "disabled"
+      else
+          bad "The rename failed. The folder is unchanged."; exit 1
+      fi
+      ;;
+  restore)
+      alyx_running && { bad "Half-Life: Alyx runs. Close the game first."; exit 1; }
+      [[ -d "$OFF" ]] || { miss "No disabled copy exists."; exit 0; }
+      both && { bad "Steam restored the dioramas. The disabled copy also exists."; exit 1; }
+      confirm "enable the dioramas?" || { miss "cancelled"; exit 0; }
+      if mv -n "$OFF" "$ON" && [[ "$(state)" == "enabled" ]]; then
+          ok "enabled"
+      else
+          bad "The rename failed. The folder is unchanged."; exit 1
+      fi
+      ;;
+esac
