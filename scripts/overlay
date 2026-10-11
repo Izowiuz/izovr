@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# SESSION SETTING. --apply starts WayVR, --restore stops it.
+#
+# WayVR shows desktop screens, windows and apps as panels in VR.
+# Start it after the headset and both controllers are active: WayVR reads its
+# controller bindings once, at startup, and skips a chord for an absent hand.
+# The Steam dashboard takes all controller input while it is open.
+#
+# The binary comes from IZOVR_WAYVR, by default ~/Git/wayvr/target/release/wayvr.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+WAYVR_BIN="${IZOVR_WAYVR:-$HOME/Git/wayvr/target/release/wayvr}"
+WAYVR_LOG="$REPORT_DIR/wayvr.log"
+
+title "WayVR overlay"
+
+case "$MODE" in
+  help) sed -n '2,9p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "$WAYVR_BIN, $WAYVR_PIDFILE"
+      if [[ -x "$WAYVR_BIN" ]]; then
+          cmp_state "wayvr binary" "present" "present"
+      else
+          cmp_state "wayvr binary" "missing" "present"
+          info "Build WayVR in ~/Git/wayvr."
+      fi
+      steamvr_running && s=running || s=stopped
+      cmp_state "steamvr" "$s" "running"
+      wayvr_pid >/dev/null && w=running || w=stopped
+      cmp_state "wayvr" "$w" "running"
+      if [[ "$w" == stopped ]]; then hint "$0"; fi
+      ;;
+  apply)
+      [[ -x "$WAYVR_BIN" ]] || { bad "Build WayVR in ~/Git/wayvr."; exit 1; }
+      steamvr_running || { bad "SteamVR does not run. Start SteamVR first."; exit 1; }
+      wayvr_pid >/dev/null && { ok "WayVR runs already."; exit 0; }
+
+      # --wait: retry every 5 s while the OpenVR runtime is not up yet, instead of
+      # exiting. Right after SteamVR starts, vrserver runs before it takes clients.
+      setsid -f "$WAYVR_BIN" --wait --log-to "$WAYVR_LOG" </dev/null >/dev/null 2>&1
+      for _ in $(seq 10); do wayvr_pid >/dev/null && break; sleep 0.5; done
+      if wayvr_pid >/dev/null; then
+          ok "WayVR starts. The log is in reports/wayvr.log."
+      else
+          priv_failed "" "$WAYVR_BIN" --wait --log-to "$WAYVR_LOG"
+          exit 1
+      fi
+      ;;
+  restore)
+      pid=$(wayvr_pid) || { ok "WayVR does not run."; exit 0; }
+      kill -TERM "$pid" 2>/dev/null
+      for _ in $(seq 10); do [[ -d "/proc/$pid" ]] || break; sleep 0.5; done
+      [[ -d "/proc/$pid" ]] && kill -KILL "$pid" 2>/dev/null
+      ok "WayVR stops."
+      ;;
+esac

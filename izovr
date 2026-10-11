@@ -2,30 +2,126 @@
 # Status overview. Runs the check of every setting; changes nothing.
 #   ./izovr            everything
 #   ./izovr session    what to switch before and after playing
+#   ./izovr start      stop the tunnel, wait for the dongle, start SteamVR and WayVR
+#   ./izovr stop       stop WayVR, close SteamVR, bring the tunnel back
 set -uo pipefail
 cd "$(dirname "$0")"
 for a in "$@"; do [[ "$a" == "--brief" ]] && export IZOVR_BRIEF=1; done
 source scripts/lib.sh
 
-PERMANENT=(rt-priority regdomain firewall-ports gpu-isolation dongle-powersave polkit-network)
+PERMANENT=(rt-priority regdomain firewall-ports gpu-isolation dongle-powersave polkit-network overlay-layout)
 CAVEAT=(idle-wifi-card vrlink-encoder)
-SESSION=(vpn-tunnel dongle-lowlatency pipewire-resample)
+SESSION=(vpn-tunnel dongle-lowlatency pipewire-resample overlay)
+
+STEAMVR_START_WAIT=60
+SESSION_WAIT=300
 
 if [[ "${1:-}" == "session" ]]; then
     printf '\n%sBefore playing%s\n' "$C_B" "$C_0"
     cat <<'A'
-  ./scripts/vpn-tunnel --apply          stop the tunnel (it kills VR sessions)
   plug in the dongle
-  start SteamVR by hand                 Steam will not do it for you
+  ./izovr start                         tunnel, SteamVR, WayVR
   ./scripts/dongle-lowlatency --apply   optional radio tweaks
-  ./scripts/pipewire-resample --apply       only if audio crackles
+  ./scripts/pipewire-resample --apply   only if audio crackles
 A
     printf '\n%sAfter playing%s\n' "$C_B" "$C_0"
     cat <<'B'
-  ./scripts/vpn-tunnel --restore        tunnel back up
+  ./izovr stop                          WayVR, SteamVR, tunnel
   ./scripts/pipewire-resample --restore
-  unplug the dongle                     otherwise Steam retries every 60s
 B
+    echo
+    exit 0
+fi
+
+# start and stop state their intent, so the scripts they call do not ask again.
+# sudo still asks for the password.
+if [[ "${1:-}" == "start" ]]; then
+    export IZOVR_YES=1
+    title "Start the VR session"
+
+    # An orphan from an earlier run counts as running but serves nothing.
+    if steamvr_running && ! steamvr_live; then
+        steamvr_stop || exit 1
+    fi
+
+    # vrlink binds every interface at startup, so the tunnel must stop first.
+    if [[ "$(systemctl is-active "$VPN_UNIT" 2>/dev/null)" == active ]]; then
+        steamvr_running && restart=1 || restart=0
+        ./scripts/vpn-tunnel --apply || exit 1
+        if (( restart )); then
+            info "vrlink binds its transports at startup. The script restarts SteamVR."
+            steamvr_stop || exit 1
+        fi
+    fi
+
+    # For the same reason the dongle must be connected to the headset first. The
+    # dongle is a client of the access point in the headset, so it has no link
+    # while the headset is off. A SteamVR started before that streams over eno1
+    # through the router, and the headset does not see the dongle.
+    # The wait has no limit: the headset often goes on after this script starts.
+    # Ctrl+C stops it.
+    if ! dongle_connected; then
+        info "Plug in the dongle. Turn on the headset."
+        until dongle_connected; do sleep 1; done
+    fi
+    ok "The dongle is connected to the headset."
+    if steamvr_running && ! vrlink_uses_dongle; then
+        info "vrlink does not use the dongle. The script restarts SteamVR."
+        steamvr_stop || exit 1
+    fi
+
+    if ! steamvr_running; then
+        # The run is up when vrserver.txt names the PID of the live vrserver in its
+        # startup line. Before that, vr_session would read the previous run.
+        info "Steam starts SteamVR."
+        setsid -f steam "steam://rungameid/$STEAMVR_APPID" </dev/null >/dev/null 2>&1
+        for _ in $(seq "$STEAMVR_START_WAIT"); do
+            live=$(steamvr_procs | awk '$2 == "vrserver" {print $1; exit}')
+            [[ -n "$live" && "$(vrserver_run_pid)" == "$live" ]] && break
+            sleep 1
+        done
+        if ! steamvr_running; then
+            bad "SteamVR does not start in $STEAMVR_START_WAIT s. Start SteamVR by hand."
+            exit 1
+        fi
+    fi
+    ok "SteamVR runs."
+
+    # WayVR needs only a running SteamVR. Its bindings are plain sources, no chords,
+    # and SteamVR loads them again for a controller that turns on later.
+    ./scripts/overlay --apply || exit 1
+
+    read -r link hmd ctl <<< "$(vr_session)"
+    if ! (( link && hmd && ctl >= 2 )); then
+        info "Put on the headset. Turn on both controllers."
+    fi
+    said_hmd=0; said_ctl=0
+    for _ in $(seq "$SESSION_WAIT"); do
+        read -r link hmd ctl <<< "$(vr_session)"
+        (( link && hmd )) && (( !said_hmd )) && { ok "The headset is connected."; said_hmd=1; }
+        (( ctl >= 2 )) && (( !said_ctl )) && { ok "Both controllers are on."; said_ctl=1; }
+        (( link && hmd && ctl >= 2 )) && break
+        sleep 1
+    done
+    if ! (( link && hmd && ctl >= 2 )); then
+        miss "The session is not ready after $SESSION_WAIT s."
+    fi
+
+    info "Close the Steam dashboard with the System button. The dashboard blocks input to WayVR."
+    echo
+    exit 0
+fi
+
+if [[ "${1:-}" == "stop" ]]; then
+    export IZOVR_YES=1
+    title "Stop the VR session"
+    ./scripts/overlay --restore
+    title "SteamVR processes"
+    steamvr_stop
+    if [[ "$(systemctl is-active "$VPN_UNIT" 2>/dev/null)" != active ]]; then
+        ./scripts/vpn-tunnel --restore
+    fi
+    info "Unplug the dongle. Steam retries the connection every 60 s while the dongle is in."
     echo
     exit 0
 fi

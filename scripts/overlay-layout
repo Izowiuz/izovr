@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# PERMANENT SETTING. --apply writes the panel layout into WayVR, --restore puts back
+# the state from before the last --apply.
+#
+# Two sets: the desk (two monitors as one curved ultrawide, the keyboard under
+# them) and the side (one monitor to the right, the keyboard straight ahead).
+# overlay-layout.py holds the numbers: distance, size, gap. Change them there.
+# WayVR saves its state on exit, so this script stops WayVR before it writes
+# and starts it again after.
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
+
+DIR="$(dirname "$0")"
+GEN="$DIR/overlay-layout.py"
+BACKUP="$REPORT_DIR/wayvr-state.json5"
+
+title "WayVR layout"
+
+case "$MODE" in
+  help) sed -n '2,9p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  check)
+      probe "$WAYVR_STATE against $GEN"
+      if [[ ! -f "$WAYVR_STATE" ]]; then
+          cmp_state "layout" "missing" "matches"
+          hint "$0"
+      elif python3 -I "$GEN" check "$WAYVR_STATE"; then
+          cmp_state "layout" "matches" "matches"
+      else
+          cmp_state "layout" "differs" "matches"
+          hint "$0"
+      fi
+      ;;
+  apply)
+      wayvr_pid >/dev/null && running=1 || running=0
+      (( running )) && "$DIR/overlay" --restore
+      backed=0
+      if [[ -f "$WAYVR_STATE" ]]; then
+          cp "$WAYVR_STATE" "$BACKUP" && backed=1
+      fi
+      if ! python3 -I "$GEN" write "$WAYVR_STATE"; then
+          priv_failed "" python3 -I "$GEN" write "$WAYVR_STATE"
+          exit 1
+      fi
+      if (( backed )); then
+          ok "The layout is written. The backup is in reports/wayvr-state.json5."
+      else
+          cmp_state "layout" "matches" "matches"
+      fi
+      if (( running )); then "$DIR/overlay" --apply; fi
+      ;;
+  restore)
+      [[ -f "$BACKUP" ]] || { miss "There is no backup. Run --apply first."; exit 0; }
+      wayvr_pid >/dev/null && running=1 || running=0
+      (( running )) && "$DIR/overlay" --restore
+      cp "$BACKUP" "$WAYVR_STATE"
+      ok "The backup is back in place."
+      if (( running )); then "$DIR/overlay" --apply; fi
+      ;;
+esac
