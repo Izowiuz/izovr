@@ -8,8 +8,16 @@
 # It also kills a shell whose arguments mention SteamVR.
 # This script reads /proc/<pid>/exe and the AppId, then walks the process tree.
 # It always spares itself and its own parents.
+#
+# usage: steamvr-nuke [--apply | --help]
+#   (no option)  Show the SteamVR processes. Change nothing.
+#   --apply      Close the SteamVR processes.
+#   -h, --help   Show this help.
 set -uo pipefail
+IZOVR_MODES="apply"
 source "$(dirname "$0")/lib.sh"
+
+[[ "$MODE" == help ]] && { sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0; }
 
 APPID=250820
 
@@ -30,8 +38,7 @@ seeds() {
     local d pid exe cl
     for d in /proc/[0-9]*; do
         pid=${d#/proc/}
-        exe=$(readlink -f "$d/exe" 2>/dev/null)
-        case "$exe" in */SteamVR/bin/linux64/*) echo "$pid"; continue ;; esac
+        steamvr_bin "$pid" >/dev/null && { echo "$pid"; continue; }
         # The process can exit between the glob and this read. The shell reports a
         # failed input redirection itself, so stderr must be closed around the
         # whole group: a trailing 2>/dev/null arrives too late to catch it.
@@ -57,7 +64,7 @@ tree() {
     for pid in $out; do
         [[ "$keep" == *" $pid "* ]] && continue
         [[ -r "/proc/$pid/stat" ]] || continue
-        nm=$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
+        nm=$(steamvr_bin "$pid") || nm=$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
         # pressure-vessel runs some helpers where /proc/<pid>/exe is unreadable
         # from outside its namespace; comm still names them.
         [[ -z "$nm" ]] && nm=$(cat "/proc/$pid/comm" 2>/dev/null)
@@ -66,7 +73,6 @@ tree() {
 }
 
 case "$MODE" in
-  help) sed -n '2,10p' "$0" | sed 's/^# \?//'; exit 0 ;;
   check)
       probe "/proc/<pid>/exe and AppId=$APPID in /proc/<pid>/cmdline"
       found=$(tree)
@@ -103,5 +109,4 @@ case "$MODE" in
           echo "$left" | while read -r pid nm; do info "$pid ${nm:-?}"; done
       fi
       ;;
-  restore) miss "nothing to restore - start SteamVR from Steam" ;;
 esac

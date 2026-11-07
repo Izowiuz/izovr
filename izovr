@@ -1,13 +1,78 @@
 #!/usr/bin/env bash
-# Status overview. Runs the check of every setting; changes nothing.
-#   ./izovr            everything
-#   ./izovr session    what to switch before and after playing
-#   ./izovr start      stop the tunnel, wait for the dongle, start SteamVR and WayVR
-#   ./izovr stop       stop WayVR, close SteamVR, bring the tunnel back
+# The entry point to everything in this repo. ./izovr --help lists the commands.
+# Without a command it runs the check of every setting and changes nothing.
+# start, stop, session, nuke, verify and measure are its own commands.
+# Any other name runs that script from scripts/ (or from alyx/, after "alyx")
+# and passes the rest of the arguments on, so each script's --help still works.
 set -uo pipefail
 cd "$(dirname "$0")"
-for a in "$@"; do [[ "$a" == "--brief" ]] && export IZOVR_BRIEF=1; done
+
+# --brief may stand anywhere. It is not passed on: the scripts read IZOVR_BRIEF,
+# and a script with IZOVR_MODES would reject the word.
+ARGS=()
+for a in "$@"; do
+    if [[ "$a" == "--brief" ]]; then export IZOVR_BRIEF=1; else ARGS+=("$a"); fi
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
 source scripts/lib.sh
+
+# A runnable script in a directory: executable, not a helper that is sourced.
+runnable() { [[ -f "$1" && -x "$1" && "$1" != *.py && "$1" != */lib.sh && "$1" != */common.sh ]]; }
+
+# The first sentence of the comment block at the top of a script. A leading
+# "SESSION SETTING." or "PERMANENT SETTING." is a group tag, not the description.
+describe() {
+    awk 'NR==1{next} /^#[[:space:]]*$/||!/^#/{exit} {sub(/^# ?/,""); s=s (s?" ":"") $0} END{print s}' "$1" |
+        sed -E 's/^(SESSION|PERMANENT) SETTING\. //; s/^([^.]*[.:])( .*)?$/\1/'
+}
+
+usage() {
+    cat <<'U'
+usage: izovr [command] [--brief]
+  (no command)         Check every setting. Change nothing.
+  start                Start the VR session.
+  stop                 Stop the VR session.
+  session              Show the steps before and after playing.
+  nuke                 Close every SteamVR process.
+  verify               Check the running VR session.
+  measure [seconds]    Count stream problems during play.
+  <script> [option]    Run one script. Its --help shows the options.
+  alyx <script> [option]
+                       Run one Half-Life: Alyx script.
+  --brief              Hide the probe lines.
+  -h, --help           Show this help.
+
+scripts
+U
+    local f
+    for f in scripts/* alyx/*; do
+        runnable "$f" || continue
+        n=${f#scripts/}; n=${n/#alyx\//alyx }
+        printf '  %-22s %s\n' "$n" "$(describe "$f")"
+    done
+    echo
+}
+
+# A command of izovr itself takes no further argument, except measure.
+no_more() { (( $# == 0 )) || unknown_option "$1"; }
+
+CMD="${1:-}"
+case "$CMD" in
+    -h|--help) no_more "${@:2}"; usage; exit 0 ;;
+    ""|start|stop|session) no_more "${@:2}" ;;
+    nuke)    no_more "${@:2}"; exec ./scripts/steamvr-nuke --apply ;;
+    verify)  no_more "${@:2}"; exec ./scripts/vr-verify ;;
+    measure)
+        (( $# <= 2 )) || unknown_option "$3"
+        [[ $# -lt 2 || "$2" =~ ^[0-9]+$ ]] || unknown_option "$2"
+        exec ./scripts/measure "${@:2}" ;;
+    alyx)
+        [[ -n "${2:-}" ]] && runnable "alyx/$2" || unknown_option "alyx${2:+ $2}"
+        exec "./alyx/$2" "${@:3}" ;;
+    *)
+        [[ "$CMD" != */* ]] && runnable "scripts/$CMD" || unknown_option "$CMD"
+        exec "./scripts/$CMD" "${@:2}" ;;
+esac
 
 PERMANENT=(rt-priority regdomain firewall-ports gpu-isolation dongle-powersave polkit-network overlay-layout)
 CAVEAT=(idle-wifi-card vrlink-encoder)
@@ -16,7 +81,7 @@ SESSION=(vpn-tunnel dongle-lowlatency pipewire-resample overlay)
 STEAMVR_START_WAIT=60
 SESSION_WAIT=300
 
-if [[ "${1:-}" == "session" ]]; then
+if [[ "$CMD" == session ]]; then
     printf '\n%sBefore playing%s\n' "$C_B" "$C_0"
     cat <<'A'
   plug in the dongle
@@ -35,7 +100,7 @@ fi
 
 # start and stop state their intent, so the scripts they call do not ask again.
 # sudo still asks for the password.
-if [[ "${1:-}" == "start" ]]; then
+if [[ "$CMD" == start ]]; then
     export IZOVR_YES=1
     title "Start the VR session"
 
@@ -112,7 +177,7 @@ if [[ "${1:-}" == "start" ]]; then
     exit 0
 fi
 
-if [[ "${1:-}" == "stop" ]]; then
+if [[ "$CMD" == stop ]]; then
     export IZOVR_YES=1
     title "Stop the VR session"
     ./scripts/overlay --restore

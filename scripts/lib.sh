@@ -20,20 +20,36 @@ else
     C_G=''; C_Y=''; C_R=''; C_B=''; C_D=''; C_0=''
 fi
 
-MODE=check
-for a in "$@"; do
-    case "$a" in
-        --apply)   MODE=apply ;;
-        --restore) MODE=restore ;;
-        -h|--help) MODE=help ;;
-    esac
-done
-
 ok()   { printf '  %s[ ok ]%s %s\n'   "$C_G" "$C_0" "$*"; }
 miss() { printf '  %s[ -- ]%s %s\n'   "$C_Y" "$C_0" "$*"; }
 bad()  { printf '  %s[fail]%s %s\n'   "$C_R" "$C_0" "$*"; }
 info() { printf '  %s%s%s\n'          "$C_D" "$*" "$C_0"; }
 title(){ printf '\n%s%s%s\n' "$C_B" "$*" "$C_0"; }
+
+# A script that sets IZOVR_MODES before it sources this file (for example
+# IZOVR_MODES="apply") accepts only those modes and --help. Any other argument
+# stops it with exit code 2 before it does anything. A script without
+# IZOVR_MODES ignores arguments it does not know, because some read their own.
+unknown_option() {
+    bad "The script does not know the option $1."
+    info "Run ${0##*/} --help to see the options."
+    exit 2
+}
+MODE=check
+for a in "$@"; do
+    case "$a" in
+        --apply)   m=apply ;;
+        --restore) m=restore ;;
+        -h|--help) m=help ;;
+        *)         m="" ;;
+    esac
+    if [[ -n "${IZOVR_MODES+x}" ]] &&
+       [[ -z "$m" || ( "$m" != help && " $IZOVR_MODES " != *" $m "* ) ]]; then
+        unknown_option "$a"
+    fi
+    [[ -n "$m" ]] && MODE=$m
+done
+unset m
 
 # hint <script-name> - printed when something is not applied and we are only checking
 # The path is relative to the repo root, so it is right for scripts outside scripts/.
@@ -88,16 +104,30 @@ VRLINK_UDP="10400-10401"
 # it, the scripts in this repo included, which reads as a false positive. Resolving
 # /proc/<pid>/exe dodges both: that is the real binary on disk, whatever the process
 # has renamed itself to. Prints one "<pid> <binary>" line per SteamVR process.
+#
+# Steam can update SteamVR while it runs. It moves the old files to
+# steamapps/temp/<appid>/ and deletes them, so the exe link of a running process
+# then reads ".../steamapps/temp/250820/bin/linux64/vrserver (deleted)".
+# steamvr_bin <pid> prints the binary name of a SteamVR process, from either place.
+STEAMVR_APPID=250820
+steamvr_bin() {
+    local exe; exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+    exe=${exe% (deleted)}
+    case "$exe" in
+        */SteamVR/bin/linux64/*|*/steamapps/temp/"$STEAMVR_APPID"/bin/linux64/*) echo "${exe##*/}" ;;
+        *) return 1 ;;
+    esac
+}
 steamvr_procs() {
-    local d exe
+    local d bin
     for d in /proc/[0-9]*; do
-        exe=$(readlink -f "$d/exe" 2>/dev/null) || continue
-        case "$exe" in */SteamVR/bin/linux64/*) printf '%s %s\n' "${d#/proc/}" "${exe##*/}" ;; esac
+        bin=$(steamvr_bin "${d#/proc/}") && printf '%s %s\n' "${d#/proc/}" "$bin"
     done
 }
 steamvr_pids()    { steamvr_procs | awk '{print $1}'; }
 steamvr_running() { [[ -n "$(steamvr_pids)" ]]; }
-export -f steamvr_procs steamvr_pids steamvr_running
+export STEAMVR_APPID
+export -f steamvr_bin steamvr_procs steamvr_pids steamvr_running
 
 # A `sudo cmd && ok "..."` pair prints nothing at all when the command fails: the &&
 # short-circuits, the script still exits 0, and a change that never happened looks
@@ -119,7 +149,6 @@ run_priv() {
 }
 
 VPN_UNIT=wg-quick@wg0-client
-STEAMVR_APPID=250820
 
 # --- SteamVR process tree -------------------------------------------------------
 # Steam keeps the STOP button lit while the reaper it started is alive.
@@ -145,8 +174,7 @@ _steamvr_seeds() {
     local d pid exe cl
     for d in /proc/[0-9]*; do
         pid=${d#/proc/}
-        exe=$(readlink -f "$d/exe" 2>/dev/null)
-        case "$exe" in */SteamVR/bin/linux64/*) echo "$pid"; continue ;; esac
+        steamvr_bin "$pid" >/dev/null && { echo "$pid"; continue; }
         # The process can exit between the glob and this read. The shell reports a
         # failed input redirection itself, so stderr must be closed around the
         # whole group: a trailing 2>/dev/null arrives too late to catch it.
@@ -173,7 +201,7 @@ steamvr_tree() {
     for pid in $out; do
         [[ "$keep" == *" $pid "* ]] && continue
         [[ -r "/proc/$pid/stat" ]] || continue
-        nm=$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
+        nm=$(steamvr_bin "$pid") || nm=$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
         # pressure-vessel runs some helpers where /proc/<pid>/exe is unreadable
         # from outside its namespace; comm still names them.
         [[ -z "$nm" ]] && nm=$(cat "/proc/$pid/comm" 2>/dev/null)
@@ -225,7 +253,7 @@ vrserver_run_pid() { vrserver_run | sed -n 's/.*vrserver .* startup with PID=\([
 steamvr_live() {
     local pid; pid=$(vrserver_run_pid)
     [[ -n "$pid" ]] || return 1
-    [[ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" == */SteamVR/bin/linux64/vrserver ]]
+    [[ "$(steamvr_bin "$pid")" == vrserver ]]
 }
 
 # vr_session prints "<link> <hmd> <controllers>" for the current SteamVR run:
